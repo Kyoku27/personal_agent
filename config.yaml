@@ -1,0 +1,13 @@
+feishu:
+  revenue_bitable:
+    app_token: "${FEISHU_BITABLE_APP_TOKEN}"
+    table_id: "${FEISHU_BITABLE_TABLE_ID}"
+    date_field: "month"
+    revenue_field: "revenue"
+    orders_field: "orders"
+    platform_field: "platform"
+    avg_order_value_field: "avg_order_value"
+
+schedule:
+  revenue_sync_cron: "0 9 1 * *"
+
