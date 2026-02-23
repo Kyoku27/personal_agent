@@ -5,15 +5,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 import yaml
-
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 _CACHED_CONFIG: Optional[dict[str, Any]] = None
 
+# 自动加载根目录的 .env 文件内容到环境变量
+load_dotenv(BASE_DIR / ".env")
+
 
 def get_env(key: str, default: Optional[str] = None) -> Optional[str]:
-    """读取环境变量的简单封装。"""
-    return os.getenv(key, default)
+    """读取环境变量的简单封装。支持自动从基于根目录的 .env 加载。"""
+    return os.environ.get(key, default)
 
 
 def get_project_path(*parts: str) -> Path:

@@ -1,3 +1,14 @@
+from __future__ import annotations
+
+import requests
+from dataclasses import dataclass
+from typing import Any
+
+from src.core.config_manager import get_env
+
+# The user provided a larksuite.com URL, so we must use the international API base URL
+FEISHU_BASE_URL = "https://open.larksuite.com/open-apis"
+
 
 def _get_tenant_access_token() -> str:
     app_id = get_env("FEISHU_APP_ID") or ""
@@ -34,18 +45,6 @@ def send_text_to_open_id(open_id: str, text: str) -> None:
     data = resp.json()
     if data.get("code") != 0:
         raise RuntimeError(f"发送飞书消息失败: {data}")
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any
-
-import requests
-
-from src.core.config_manager import get_env
-
-
-FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 
 
 @dataclass

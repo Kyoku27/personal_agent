@@ -1,10 +1,10 @@
-from __future__ import annotations
-
+import logging
 from dataclasses import dataclass
 from datetime import date, timedelta
 
 from .api_client import RakutenApiClient
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class RakutenDataAnalyzer:
@@ -18,25 +18,35 @@ class RakutenDataAnalyzer:
             end = date(year, month + 1, 1)
         return start, end - timedelta(days=1)
 
-    def get_revenue_summary(self, year: int, month: int) -> dict:
-        """按月汇总乐天营业额的占位实现，返回统一结构。
-
-        当前版本不调用真实 API，而是基于占位数据返回 0 值，
-        方便先把整体工作流串起来。
+    def get_revenue_summary(self, target_date: date) -> list[dict]:
+        """按特定日期、按 SKU 汇总乐天营业额。
+        
+        通过 RakutenApiClient 拉取对应日期数据，并整理为飞书支持的统一结构列表。
         """
-        start, end = self._month_range(year, month)
-        _ = (start, end, self.client)
+        logger.info(f"正在拉取 SKU 级别销售数据 [乐天] -> {target_date.strftime('%Y-%m-%d')}")
 
-        revenue = 0.0
-        orders = 0
-        avg_order_value = 0.0
+        # 调用 API 客户端获取原始销售单日数据 (现在返回 List)
+        raw_sku_list = self.client.get_sales_data(start_date=str(target_date), end_date=str(target_date))
 
-        return {
-            "platform": "rakuten",
-            "year": year,
-            "month": month,
-            "revenue": revenue,
-            "orders": orders,
-            "avg_order_value": avg_order_value,
-        }
+        results = []
+        total_revenue = 0.0
+        
+        for item in raw_sku_list:
+            # 这里的 sku 对应乐天后台下载受注清单的 sku或者商品管理番号
+            sku_name = item.get("sku", "UNKNOWN-SKU")
+            revenue = float(item.get("sales", 0.0))
+            orders = int(item.get("order_count", 0))
+
+            total_revenue += revenue
+
+            results.append({
+                "platform": "rakuten",
+                "date": target_date,
+                "sku": sku_name,
+                "revenue": revenue,
+                "orders": orders,
+            })
+            
+        logger.info(f"乐天 {target_date.strftime('%Y-%m-%d')} (按SKU) 汇总完成: 共 {len(results)} 个 SKU, 总营业额={total_revenue}")
+        return results
 
