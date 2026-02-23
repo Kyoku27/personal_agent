@@ -30,11 +30,11 @@ pip install -r requirements.txt
 # Feishu / Lark
 FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
 FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
-FEISHU_BITABLE_APP_TOKEN=XMbqb...  # BaseのURL内から取得
-FEISHU_BITABLE_TABLE_ID=tblMX...   # BaseのURL内から取得
+FEISHU_BITABLE_APP_TOKEN=xxxxxxxxxxxxxxxx  # BaseのURL内から取得
+FEISHU_BITABLE_TABLE_ID=xxxxxxxxxxxxxxxx  # BaseのURL内から取得
 
 # 楽天 RMS
-RAKUTEN_API_KEY=SP397230_xxx:SL397230_xxx   # serviceSecret:licenseKey
+RAKUTEN_API_KEY=xxxxxxxxxxxxxxxx  # serviceSecret:licenseKey
 RAKUTEN_SHOP_ID=your_shop_id
 RAKUTEN_BASE_URL=https://api.rms.rakuten.co.jp
 ```
