@@ -59,7 +59,32 @@ python run_rakuten_sync.py --inspect
 
 ---
 
-### 2. ページ分析
+### 2. Amazon 排名 → Lark 电子表格 同步
+
+从飞书电子表格 A 列读取 ASIN，抓取 Amazon 日本站排名，写回当日列和 F 列（小类目）。
+
+**設定（`.env` ファイル）：**
+
+```env
+FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
+FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
+FEISHU_SHEET_TOKEN=xxxxxxxxxxxxxxxx   # 电子表格 URL 中 /sheets/ 后面的 token
+FEISHU_SHEET_NAME=3月                  # Sheet 名称，默认当前月份
+```
+
+**実行方法：**
+
+```bash
+# 默认 Sheet（FEISHU_SHEET_NAME 或当前月份）
+python run_amazon_rank.py
+
+# 指定 Sheet 名称
+python run_amazon_rank.py --sheet 3月
+```
+
+---
+
+### 3. ページ分析
 
 Web ページの SEO タイトル・meta 描述・H1・Open Graph などを取得。
 
@@ -78,6 +103,7 @@ personal_agent/
 ├── config.yaml               # Lark Bitable フィールドマッピング設定
 ├── requirements.txt          # Python 依存ライブラリ
 ├── run_rakuten_sync.py       # 楽天→Lark 同期スクリプト
+├── run_amazon_rank.py        # Amazon 排名→Lark Sheet 同期
 ├── run_page_analysis.py      # ページ分析スクリプト
 └── src/
     ├── core/
@@ -89,7 +115,8 @@ personal_agent/
         │       └── data_analyzer.py  # 受注データ集計
         └── feishu/
             ├── bot_client.py         # Lark 認証（tenant_access_token）
-            └── sheet_manager.py      # Lark 多维表格 CRUD
+            ├── sheet_manager.py      # Lark 多维表格 CRUD
+            └── amazon_rank_sync.py   # Amazon 排名→Lark 电子表格
 ```
 
 ---
