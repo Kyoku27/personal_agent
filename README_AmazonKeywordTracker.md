@@ -13,7 +13,7 @@ FEISHU_APP_ID=cli_axxxxxxxxxx
 FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
 
 # 关键词追踪表格专属 Token 与 Sheet 名称配置
-FEISHU_KEYWORD_SHEET_TOKEN=KbyvsiPLyhZufEtakX4jPypRpoh  # 你的追踪表格的 Token
+FEISHU_KEYWORD_SHEET_TOKEN=xxxxxxxxxxxxxxxx  # 你的追踪表格的 Token
 FEISHU_KEYWORD_SHEET_NAME=KW追踪                 # 存放数据结果的 Sheet 名称，默认 KW追踪
 ```
 
