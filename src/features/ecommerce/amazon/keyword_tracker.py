@@ -29,6 +29,15 @@ DEFAULT_HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+}
+
+# 模拟东京邮编 151-0071 的 Cookie（非常重要，决定了排名是否准确）
+TOKYO_COOKIES = {
+    "i18n-prefs": "JPY",
+    "lc-acbjp": "ja_JP",
+    "session-id": f"{random.randint(100,999)}-{random.randint(1000000,9999999)}-{random.randint(1000000,9999999)}",
+    "ubid-acbjp": f"{random.randint(100,999)}-{random.randint(1000000,9999999)}-{random.randint(1000000,9999999)}",
 }
 
 
@@ -146,14 +155,23 @@ def load_keywords_from_lark(sheet_title: str = "Master") -> list[dict]:
 
 
 # =========================
-# Amazon 搜索页面（带简单容错）
+# Amazon 搜索页面（支持翻页和邮编模拟）
 # =========================
-def get_amazon_page(keyword: str, timeout: int = 15) -> str | None:
+def get_amazon_page(keyword: str, page: int = 1, timeout: int = 15) -> str | None:
     url = f"https://www.amazon.co.jp/s?k={keyword}"
+    if page > 1:
+        url += f"&page={page}"
+    
     try:
-        r = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+        # 使用 Session 保持邮编设置
+        session = requests.Session()
+        # 第一次请求设置基础状态
+        session.get("https://www.amazon.co.jp", headers=DEFAULT_HEADERS, timeout=timeout, cookies=TOKYO_COOKIES)
+        
+        # 正式请求结果页
+        r = session.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
         if r.status_code == 503:
-            print(f"[WARN] Amazon returned 503 (Anti-scraping) for keyword='{keyword}'")
+            print(f"[WARN] Amazon returned 503 (Anti-scraping) for keyword='{keyword}' page={page}")
             return None
         r.raise_for_status()
         return r.text
@@ -165,9 +183,9 @@ def get_amazon_page(keyword: str, timeout: int = 15) -> str | None:
 # =========================
 # 解析自然位排名
 # =========================
-def extract_organic_rank(soup: BeautifulSoup, asin: str, max_rank: int = MAX_RANK) -> int:
+def extract_organic_rank(soup: BeautifulSoup, asin: str, offset: int = 0) -> int | None:
     results = soup.select("div[data-asin]")
-    rank = 1
+    rank_in_page = 1
 
     for r in results:
         asin_found = r.get("data-asin")
@@ -178,23 +196,26 @@ def extract_organic_rank(soup: BeautifulSoup, asin: str, max_rank: int = MAX_RAN
         classes = " ".join(r.get("class", []))
         if "AdHolder" in classes or "sp-sponsored-result" in classes:
             continue
+        
+        # 跳过空卡片（有时会有无 ASIN 的占位符）
+        if len(asin_found) < 5:
+            continue
 
         if asin_found == asin:
-            return rank
+            return offset + rank_in_page
 
-        rank += 1
+        rank_in_page += 1
 
-    return max_rank
+    return None
 
 
 # =========================
 # 解析广告位排名
 # =========================
-def extract_ad_rank(soup: BeautifulSoup, asin: str, max_rank: int = MAX_RANK) -> int:
-    # Amazon 广告结果组件可能不一样，这里使用通用包含 sp-sponsored-result
+def extract_ad_rank(soup: BeautifulSoup, asin: str, offset: int = 0) -> int | None:
     ads = soup.select("div[data-component-type='s-search-result'], div.AdHolder")
 
-    rank = 1
+    rank_in_page = 1
     for ad in ads:
         asin_found = ad.get("data-asin")
         if not asin_found:
@@ -206,63 +227,102 @@ def extract_ad_rank(soup: BeautifulSoup, asin: str, max_rank: int = MAX_RANK) ->
             is_sponsored = True
         else:
             sponsored_label = ad.select_one(
-                ".puis-label-popover-default, .s-label-popover-default"
+                ".puis-label-popover-default, .s-label-popover-default, .s-sponsored-label-info-icon"
             )
-            if sponsored_label and "スポンサー" in sponsored_label.get_text():
+            if sponsored_label and any(kw in sponsored_label.get_text() for kw in ["スポンサー", "Sponsored"]):
                 is_sponsored = True
-            elif "スポンサー" in ad.get_text(" ", strip=True)[:200]:
+            elif any(kw in ad.get_text(" ", strip=True)[:200] for kw in ["スポンサー", "Sponsored"]):
                 is_sponsored = True
 
         if is_sponsored:
             if asin_found == asin:
-                return rank
-            rank += 1
+                return offset + rank_in_page
+            rank_in_page += 1
 
-    return max_rank
-
-
-# =========================
-# 对外接口：单独获取自然位 / 广告位
-# =========================
-def get_organic_rank(keyword: str, asin: str) -> int:
-    html = get_amazon_page(keyword)
-    if not html:
-        return MAX_RANK
-
-    soup = BeautifulSoup(html, "html.parser")
-    return extract_organic_rank(soup, asin)
-
-
-def get_ad_rank(keyword: str, asin: str) -> int:
-    html = get_amazon_page(keyword)
-    if not html:
-        return MAX_RANK
-
-    soup = BeautifulSoup(html, "html.parser")
-    return extract_ad_rank(soup, asin)
+    return None
 
 
 # =========================
-# 一次请求同时获取自然位 + 广告位
+# 循环翻页抓取排名
 # =========================
 def get_ranks(keyword: str, asin: str) -> tuple[int, int]:
-    html = get_amazon_page(keyword)
-    if not html:
-        return MAX_RANK, MAX_RANK
+    max_pages = int(get_env("AMZ_KEYWORD_MAX_PAGES") or "1")
+    
+    final_organic = MAX_RANK
+    final_ad = MAX_RANK
+    
+    organic_offset = 0
+    ad_offset = 0
 
-    soup = BeautifulSoup(html, "html.parser")
-    organic_rank = extract_organic_rank(soup, asin)
-    ad_rank = extract_ad_rank(soup, asin)
-    return organic_rank, ad_rank
+    for p in range(1, max_pages + 1):
+        if p > 1:
+            # 翻页节流
+            time.sleep(random.uniform(1, 2))
+            
+        html = get_amazon_page(keyword, page=p)
+        if not html:
+            break
+
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # 找自然位
+        if final_organic == MAX_RANK:
+            found_org = extract_organic_rank(soup, asin, offset=organic_offset)
+            if found_org:
+                final_organic = found_org
+            else:
+                # 累加这一页的自然结果总数（用于下一页的 offset）
+                page_results = soup.select("div[data-asin]")
+                page_organic_count = 0
+                for r in page_results:
+                    asin_v = r.get("data-asin")
+                    if asin_v and len(asin_v) > 5:
+                        c = " ".join(r.get("class", []))
+                        if "AdHolder" not in c and "sp-sponsored-result" not in c:
+                            page_organic_count += 1
+                organic_offset += page_organic_count
+
+        # 找广告位
+        if final_ad == MAX_RANK:
+            found_ad = extract_ad_rank(soup, asin, offset=ad_offset)
+            if found_ad:
+                final_ad = found_ad
+            else:
+                # 累加这一页的广告结果总数
+                page_ads = soup.select("div[data-component-type='s-search-result'], div.AdHolder")
+                page_ad_count = 0
+                for a in page_ads:
+                    if a.get("data-asin"):
+                        c = " ".join(a.get("class", []))
+                        is_sp = "AdHolder" in c or "sp-sponsored-result" in c
+                        if not is_sp:
+                            label = a.select_one(".puis-label-popover-default, .s-label-popover-default, .s-sponsored-label-info-icon")
+                            if label and any(kw in label.get_text() for kw in ["スポンサー", "Sponsored"]):
+                                is_sp = True
+                        if is_sp:
+                            page_ad_count += 1
+                ad_offset += page_ad_count
+
+        # 如果两个都找到了，提前结束翻页
+        if final_organic != MAX_RANK and final_ad != MAX_RANK:
+            break
+            
+    return final_organic, final_ad
 
 
 # =========================
 # 生成记录
 # =========================
-def create_log(brand, asin, product, keyword, rank_type, rank):
-    today = datetime.now(JST).strftime("%Y-%m-%d")
+def create_log(brand, asin, product, keyword, rank_type, rank, start_time: str = ""):
+    now = datetime.now(JST)
+    today = now.strftime("%Y-%m-%d")
+    current_time = start_time or now.strftime("%H:%M:%S")
+    # 生成唯一 ID 防止 Lark Base 同步冲突
+    uid = f"{today}_{asin}_{keyword}_{rank_type}"
     return {
+        "id": uid,
         "date": today,
+        "time": current_time,
         "brand": brand,
         "asin": asin,
         "product": product,
@@ -310,7 +370,9 @@ def _append_logs_to_lark(
 
         values = [
             [
+                log["id"],
                 log["date"],
+                log["time"],
                 log["brand"],
                 log["asin"],
                 log["product"],
@@ -323,7 +385,7 @@ def _append_logs_to_lark(
 
         start_row = next_row
         end_row = next_row + len(values) - 1
-        cell_range = f"{sheet_id}!A{start_row}:G{end_row}"
+        cell_range = f"{sheet_id}!A{start_row}:I{end_row}"
 
         _batch_update(
             token,
@@ -338,7 +400,7 @@ def _append_logs_to_lark(
         return {
             "success": True,
             "message": f"已追加 {len(values)} 行到飞书 Sheet '{title}'",
-            "updated_cells": len(values) * 7,
+            "updated_cells": len(values) * 9,
         }
     except Exception as e:
         return {"success": False, "message": str(e), "updated_cells": 0}
@@ -347,14 +409,15 @@ def _append_logs_to_lark(
 # =========================
 # 对外入口：关键词追踪并写入飞书
 # =========================
-def run_keyword_tracking(
-    *, sheet_title: str | None = None, dry_run: bool = False
-) -> dict[str, Any]:
+def run_keyword_tracking(sheet_title: str = None, dry_run: bool = False) -> dict[str, Any]:
     """
     抓取关键词排名，并按品牌分 Sheet 写入：
     - brand 列为空的归到 "UNKNOWN"
     - 每个 brand 对应一个 Sheet（同一个 spreadsheet 下）
     """
+    # 捕获全局开始时间
+    start_time_str = datetime.now(JST).strftime("%H:%M:%S")
+    
     keywords = load_keywords_from_lark()
     if not keywords:
         return {
@@ -386,6 +449,7 @@ def run_keyword_tracking(
                 keyword,
                 "organic",
                 organic_rank,
+                start_time=start_time_str,
             )
         )
 
@@ -397,6 +461,7 @@ def run_keyword_tracking(
                 keyword,
                 "ad",
                 ad_rank,
+                start_time=start_time_str,
             )
         )
 
@@ -444,7 +509,7 @@ def run_keyword_tracking(
 
     return {
         "success": True,
-        "message": f"已按品牌写入 {len(by_brand)} 个 Sheet，总计 {total_cells} 个单元格",
+        "message": f"已写入到飞书 Sheet '{dest_sheet}'，更新了 {total_cells} 个单元格",
         "updated_cells": total_cells,
     }
 

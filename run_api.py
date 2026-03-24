@@ -9,9 +9,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import datetime
+import csv
+import urllib.request
+import json
+from io import StringIO
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.features.page_analysis import PageAnalyzer
@@ -111,12 +116,135 @@ def feishu_amazon_rank_sync(body: dict | None = Body(default=None)):
     return run_amazon_rank_sync(sheet_title=sheet_title)
 
 
+@app.post("/api/feishu/amazon-rank/sync/stream")
+async def feishu_amazon_rank_sync_stream(request: Request, body: dict | None = Body(default=None)):
+    """流式返回的 Amazon 排名同步。"""
+    body = body or {}
+    sheet_title = body.get("sheet")
+    
+    async def event_generator():
+        from src.features.ecommerce.amazon.rank_sync import run_amazon_rank_sync_generator
+        gen = run_amazon_rank_sync_generator(sheet_title=sheet_title)
+        
+        for item in gen:
+            # 每次拿到一个事件时，检查客户端是否已断开（取消请求）
+            if await request.is_disconnected():
+                print("Client disconnected, cancelling task!")
+                break
+                
+            yield json.dumps(item) + "\n"
+            
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+
 @app.post("/api/feishu/amazon-keyword/track")
 def feishu_amazon_keyword_track(body: dict | None = Body(default=None)):
     """Amazon 关键词自然位/広告位追踪。可选 body: {"sheet": "KW追踪"}"""
     body = body or {}
     sheet_title = body.get("sheet")
     return run_keyword_tracking(sheet_title=sheet_title)
+
+
+@app.get("/api/inventory/dashboard")
+def get_inventory_dashboard(sheet: str = "rakuten"):
+    """
+    读取 Google Sheets 社内库存数据。
+    楽天・ヤフ tab (GID=224017440):
+      - A列(0) = 商品群(品牌) — 合并单元格, 需要 forward-fill
+      - B列(1) = 商品ID
+      - C列(2) = 商品名
+      - E列(4) = 型番 / SKU
+      - H列(7) = 当社在庫(社内库存)
+      - 真实数据从第 8 行开始 (index 7)
+    """
+    # 各平台销售数据（未接连真实 API）
+    sales_data = {
+        "rakuten": {"today_orders": None, "total_orders": None, "revenue": None},
+        "yahoo": {"today_orders": None, "total_orders": None, "revenue": None},
+        "shopify": {"today_orders": None, "total_orders": None, "revenue": None},
+    }
+
+    # 确认的 sheet GID:
+    # - 楽天・ヤフ (Rakuten + Yahoo): GID = 224017440
+    # - 全得意計 (Total summary) : GID = 854399422
+    sheet_gid_map = {
+        "rakuten": "224017440",
+        "all": "854399422",
+    }
+    gid = sheet_gid_map.get(sheet, "224017440")
+    base_url = "https://docs.google.com/spreadsheets/d/12LFt2HVxZpAb9WKlcEksx5D35eJjaW6lZ8Ld4EN_2Ak"
+    sheet_csv_url = f"{base_url}/export?format=csv&gid={gid}"
+
+    google_sheet_inventory = []
+    try:
+        req = urllib.request.Request(sheet_csv_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            content = response.read().decode("utf-8")
+            reader = csv.reader(StringIO(content))
+            all_rows = list(reader)
+
+            # 真实表格结构（从第4行开始读取，跳过前3行标题）:
+            # - 品牌标题行: A列=品牌名, B列=空 (如 "CZUR", "homerunPET")
+            # - 数据行: A列=空, B列=商品ID, C列=商品名, E列=型番/SKU, H列=当社在庫
+            # 跳过前3行（行1:空，行2:楽天链接，行3:スーパーセール等）
+            # 从第4行开始（index=3）是列标题行
+            data_rows = all_rows[3:]
+            print(f"[inventory] Total rows in sheet: {len(all_rows)}, scanning from row 4")
+
+            last_brand = ""
+            for row in data_rows:
+                # 至少要有2列
+                if len(row) < 2:
+                    continue
+
+                a_val = row[0].strip() if row[0] else ""
+                b_val = row[1].strip() if len(row) > 1 and row[1] else ""
+                c_val = row[2].strip() if len(row) > 2 and row[2] else ""
+                e_val = row[4].strip() if len(row) > 4 and row[4] else ""
+
+                # 排除标题行 (如果 B列是 "商品ID" 或 E列是 "型番")
+                if b_val == "商品ID" or e_val == "型番":
+                    continue
+
+                # 品牌标题行判定: A列有值 且 (B, C, E列均为空)
+                # 这种行通常是隔开不同品牌的标题行
+                if a_val and not b_val and not c_val and not e_val:
+                    if a_val not in ["商品群", "当社", "在庫"]:
+                        last_brand = a_val
+                    continue
+
+                # 数据行判定: 必须有商品ID (B列)
+                if not b_val:
+                    continue
+
+                # H 列 (index 7) = 社内库存
+                stock = row[7].strip() if len(row) > 7 and row[7] else ""
+
+                # 跳过完全空的数据内容
+                if not e_val and not c_val:
+                    continue
+
+                google_sheet_inventory.append({
+                    "brand": last_brand or "未分类",
+                    "sku": e_val,
+                    "name": c_val,
+                    "stock": stock or "0"
+                })
+
+        print(f"[inventory] Loaded {len(google_sheet_inventory)} items")
+    except Exception as e:
+        print("Fetch Google Sheet failed:", e)
+        import traceback; traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"无法读取 Google Sheets: {str(e)}"
+        }
+
+    return {
+        "success": True,
+        "sales": sales_data,
+        "inventory": google_sheet_inventory
+    }
 
 
 if __name__ == "__main__":

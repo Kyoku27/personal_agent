@@ -223,27 +223,29 @@ def _fetch_rank(asin: str) -> tuple[str | None, str | None, str]:
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
-def run_amazon_rank_sync(sheet_title: str | None = None) -> dict:
+def run_amazon_rank_sync_generator(sheet_title: str | None = None):
     """
-    执行 Amazon 排名同步。
-    :param sheet_title: 飞书 Sheet 名称，默认用 FEISHU_SHEET_NAME 或当前月份如 "3月"
-    :return: {"success": bool, "message": str, "updated_cells": int}
+    流式的 Amazon 排名同步，实时 yield 进度供前端显示与手动取消。
     """
     spreadsheet_token = get_env("FEISHU_SHEET_TOKEN") or ""
     if not spreadsheet_token:
-        return {"success": False, "message": "未配置 FEISHU_SHEET_TOKEN", "updated_cells": 0}
+        yield {"type": "error", "message": "未配置 FEISHU_SHEET_TOKEN", "updated_cells": 0}
+        return
 
     app_id = get_env("FEISHU_APP_ID") or ""
     app_secret = get_env("FEISHU_APP_SECRET") or ""
     if not app_id or not app_secret:
-        return {"success": False, "message": "未配置 FEISHU_APP_ID / FEISHU_APP_SECRET", "updated_cells": 0}
+        yield {"type": "error", "message": "未配置 FEISHU_APP_ID / FEISHU_APP_SECRET", "updated_cells": 0}
+        return
 
     title = sheet_title or (get_env("FEISHU_SHEET_NAME") or f"{datetime.now(JST).month}月")
+    yield {"type": "progress", "message": f"正在解析飞书 Sheet '{title}' 数据..."}
 
     try:
         token = _get_tenant_access_token()
         sheet_id = _resolve_sheet_id(token, spreadsheet_token, title)
         col = _ensure_today_col(token, spreadsheet_token, sheet_id)
+        
         end_row = DATA_START_ROW + MAX_ROWS - 1
         asin_rng = f"{sheet_id}!{ASIN_COL}{DATA_START_ROW}:{ASIN_COL}{end_row}"
         data = _batch_get(token, spreadsheet_token, [asin_rng])
@@ -251,17 +253,32 @@ def run_amazon_rank_sync(sheet_title: str | None = None) -> dict:
         rows = (vr[0].get("values") if vr else None) or []
 
         updates: list[dict] = []
+        valid_count = 0
+        for r in rows:
+            if _extract_asin(r[0] if r else ""):
+                valid_count += 1
+                
+        yield {"type": "progress", "message": f"共读取到 {valid_count} 个需要抓取的 ASIN，开始查询..."}
+
         for i, r in enumerate(rows):
+            # 每个循环内部的 yield 回调
+            yield {"type": "heartbeat"}
+
             row_no = DATA_START_ROW + i
             asin = _extract_asin(r[0] if r else "")
             if not asin:
                 continue
+                
             val, cat, status = None, None, "RANK_N/A"
-            for _ in range(AMZ_TRY):
+            for attempt in range(AMZ_TRY):
                 val, cat, status = _fetch_rank(asin)
                 if val:
                     break
-                time.sleep(random.uniform(AMZ_SLEEP_MIN, AMZ_SLEEP_MAX))
+                # 如果没抓到，给前端发个状态说明在重试
+                if attempt < AMZ_TRY - 1:
+                    yield {"type": "progress", "message": f"[{row_no}] {asin} 暂时没有排名，稍作重试..."}
+                    time.sleep(random.uniform(AMZ_SLEEP_MIN, AMZ_SLEEP_MAX))
+            
             updates.append({
                 "range": f"{sheet_id}!{col}{row_no}:{col}{row_no}",
                 "values": [[val or status]],
@@ -271,12 +288,31 @@ def run_amazon_rank_sync(sheet_title: str | None = None) -> dict:
                     "range": f"{sheet_id}!{AMZ_CAT_COL}{row_no}:{AMZ_CAT_COL}{row_no}",
                     "values": [[cat]],
                 })
-            print({"row": row_no, "asin": asin, "rank": val or status, "cat": cat if (status == "OK" and cat) else None})
+            
+            log_str = f"行 {row_no} | ASIN {asin} | 排名: {val or status} | 分类: {cat if (status == 'OK' and cat) else ''}"
+            print(log_str)
+            yield {"type": "progress", "message": log_str}
+            
             _sleep_jitter()
 
         if updates:
+            yield {"type": "progress", "message": "全部抓取完毕，正在将结果统一写回飞书..."}
             _batch_update(token, spreadsheet_token, updates)
-            return {"success": True, "message": f"已更新 {len(updates)} 个单元格", "updated_cells": len(updates)}
-        return {"success": True, "message": "无 ASIN 需要更新", "updated_cells": 0}
+            yield {"type": "done", "success": True, "message": f"已更新 {len(updates)} 个单元格", "updated_cells": len(updates)}
+        else:
+            yield {"type": "done", "success": True, "message": "无 ASIN 需要更新", "updated_cells": 0}
+
     except Exception as e:
-        return {"success": False, "message": str(e), "updated_cells": 0}
+        yield {"type": "error", "message": str(e), "updated_cells": 0}
+
+# 兼容旧同步方法的壳
+def run_amazon_rank_sync(sheet_title: str | None = None) -> dict:
+    result = {"success": False, "message": "Unknown error", "updated_cells": 0}
+    for event in run_amazon_rank_sync_generator(sheet_title):
+        if event["type"] in ("done", "error"):
+            result = {
+                "success": event.get("success", False) or event["type"] == "done",
+                "message": event.get("message", ""),
+                "updated_cells": event.get("updated_cells", 0)
+            }
+    return result

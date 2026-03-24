@@ -13,7 +13,7 @@ FEISHU_APP_ID=cli_axxxxxxxxxx
 FEISHU_APP_SECRET=xxxxxxxxxxxxxxxx
 
 # 关键词追踪表格专属 Token 与 Sheet 名称配置
-FEISHU_KEYWORD_SHEET_TOKEN=KbyvsiPLyhZufEtakX4jPypRpoh  # 你的追踪表格的 Token
+FEISHU_KEYWORD_SHEET_TOKEN=xxxxxxxxxxxxxxxx  # 你的追踪表格的 Token
 FEISHU_KEYWORD_SHEET_NAME=KW追踪                 # 存放数据结果的 Sheet 名称，默认 KW追踪
 ```
 
@@ -35,18 +35,19 @@ FEISHU_KEYWORD_SHEET_NAME=KW追踪                 # 存放数据结果的 Sheet
 
 ### 2. `KW追踪` (程序自动追加结果的表格)
 该 Sheet 用于保存代码抓取的结果。（名字需要和 `FEISHU_KEYWORD_SHEET_NAME` 保持一致）
-**表头如下：**
+**表头如下（共 9 列）：**
 
-| date | brand | asin | product | keyword | rank_type | rank |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 2026-03-13 | MOFT | B0891YT5WB | モフト... | moft | organic | 58 |
-| 2026-03-13 | MOFT | B0891YT5WB | モフト... | moft | ad | 999 |
-| 2026-03-13 | MOFT | B0891YT5WB | モフト... | moft x | organic | 25 |
+| id | date | time | brand | asin | product | keyword | rank_type | rank |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| ... | 2026-03-13 | 19:40:00 | MOFT | B0891YT5WB | モフト... | moft | organic | 50 |
 
-* **`rank_type` 释义**：
-  * `organic`: 自然搜索排名（排除了广告位计算）
-  * `ad`: 广告位排名（仅仅在广告区域内的顺位）
-* **`rank` = 999**: 表示在设定的最大翻页范围内（如前3页），没有找到该 ASIN 的对应词排名。
+*   **`id`**: 唯一标识符（日期+ASIN+词+类型），防止同步冲突。
+*   **`date`**: 抓取日期。
+*   **`time`**: **[新增]** 此次脚本开始执行的具体时间。
+*   **`rank_type` 释义**：
+    *   `organic`: 自然搜索排名（排除了广告位计算）
+    *   `ad`: 广告位排名（仅仅在广告区域内的顺位）
+*   **`rank` = 999**: 表示在设定的最大翻页范围内（跨页寻找），没有找到该 ASIN 的对应词排名。
 
 ---
 

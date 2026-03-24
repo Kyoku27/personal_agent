@@ -44,3 +44,7 @@ venv.bak/
 # Project specific
 logs/
 *.log
+test.csv
+debug_sheet.py
+test_csv.py
+*.csv
