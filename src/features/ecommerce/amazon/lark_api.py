@@ -28,7 +28,7 @@ def _num_to_col(n: int) -> str:
 def _headers(token: str) -> dict:
     return {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json; charset=utf-8",
+        "Content-Type": "application/json; charset=utf-8"
     }
 
 def _request_with_retry(fn, *, max_retry=LARK_RETRY, base_sleep=LARK_RETRY_BASE_SLEEP):
@@ -126,3 +126,25 @@ def _ensure_today_col(token: str, spreadsheet_token: str, sheet_id: str) -> str:
         "values": [[today]],
     }])
     return col
+def _append_data(token: str, spreadsheet_token: str, sheet_id: str, data: dict) -> dict:
+    """向表格底部追加数据"""
+    # 这里的 f"{sheet_id}!A1" 只是指定起点，会自动寻找末尾
+    url = f"{LARK_HOST}/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_append"
+
+    def _call():
+        body = {
+            "valueRange": {
+                "range": f"{sheet_id}!A1",
+                "values": data.get("valueRange", {}).get("values", [])
+            }
+        }
+        params = {"valueInputOption": "RAW"}
+        r = requests.post(url, headers=_headers(token), params=params, json=body, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"[LARK][append_data] status={r.status_code} body={r.text}")
+        res = r.json()
+        if res.get("code") != 0:
+            raise RuntimeError(f"[LARK][append_data] {res}")
+        return res
+
+    return _request_with_retry(_call)

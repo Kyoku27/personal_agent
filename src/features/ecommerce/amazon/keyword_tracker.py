@@ -11,10 +11,12 @@ from bs4 import BeautifulSoup
 from src.core.config_manager import get_env
 from src.features.feishu.bot_client import _get_tenant_access_token
 from .lark_api import (
+    LARK_HOST,
     HEADER_ROW,
     _batch_get,
     _batch_update,
     _resolve_sheet_id,
+    _append_data,
 )
 
 
@@ -39,6 +41,16 @@ TOKYO_COOKIES = {
     "session-id": f"{random.randint(100,999)}-{random.randint(1000000,9999999)}-{random.randint(1000000,9999999)}",
     "ubid-acbjp": f"{random.randint(100,999)}-{random.randint(1000000,9999999)}-{random.randint(1000000,9999999)}",
 }
+
+
+# =========================
+def _extract_text(cell: Any) -> str:
+    """从飞书单元格中提取文本内容"""
+    if cell is None:
+        return ""
+    if isinstance(cell, list):
+        return "".join([str(x.get("text", "")) for x in cell if isinstance(x, dict)])
+    return str(cell)
 
 
 # =========================
@@ -154,6 +166,104 @@ def load_keywords_from_lark(sheet_title: str = "Master") -> list[dict]:
         return []
 
 
+def add_keyword_to_master(brand: str, asin: str, product: str, keyword: str, sheet_title: str = "Master") -> dict:
+    """
+    向飞书 Master 表添加一个新关键词。
+    """
+    spreadsheet_token = (
+        get_env("FEISHU_KEYWORD_SHEET_TOKEN")
+        or get_env("FEISHU_SHEET_TOKEN")
+        or ""
+    )
+    if not spreadsheet_token:
+        return {"success": False, "message": "未配置 FEISHU_SHEET_TOKEN"}
+
+    try:
+        from .lark_api import _resolve_sheet_id, _batch_get, _batch_update
+        token = _get_tenant_access_token()
+        sheet_id = _resolve_sheet_id(token, spreadsheet_token, sheet_title)
+
+        # 读取 A 列找下一行
+        rng = f"{sheet_id}!A:A"
+        data = _batch_get(token, spreadsheet_token, [rng])
+        vr = data.get("data", {}).get("valueRanges", [])
+        rows = (vr[0].get("values") if vr else []) or []
+        next_row = len(rows) + 1
+
+        values = [[brand, asin, product, keyword]]
+        cell_range = f"{sheet_id}!A{next_row}:D{next_row}"
+        
+        _batch_update(token, spreadsheet_token, [{
+            "range": cell_range,
+            "values": values
+        }])
+        
+        return {"success": True, "message": f"关键词 '{keyword}' 已成功添加到 Master 表"}
+    except Exception as e:
+        return {"success": False, "message": f"添加失败: {str(e)}"}
+
+
+def get_keyword_history(asin: str, keyword: str, limit: int = 100, sheet_title: str | None = None) -> list[dict]:
+    """
+    从追踪表获取特定 ASIN 和关键词的历史排名。
+    """
+    spreadsheet_token = (
+        get_env("FEISHU_KEYWORD_SHEET_TOKEN")
+        or get_env("FEISHU_SHEET_TOKEN")
+        or ""
+    )
+    if not spreadsheet_token:
+        return []
+
+    title = sheet_title or (get_env("FEISHU_KEYWORD_SHEET_NAME") or "KW追踪")
+
+    try:
+        from .lark_api import _resolve_sheet_id, _batch_get
+        token = _get_tenant_access_token()
+        sheet_id = _resolve_sheet_id(token, spreadsheet_token, title)
+
+        # 获取全部数据 (最大 5000 条，最近的或者全量)
+        rng = f"{sheet_id}!A1:I5000"
+        data = _batch_get(token, spreadsheet_token, [rng])
+        vr = data.get("data", {}).get("valueRanges", [])
+        rows = (vr[0].get("values") if vr else []) or []
+
+        if len(rows) <= 1:
+            return []
+
+        # 索引定位
+        headers = [str(h).strip().lower() for h in rows[0]]
+        idx_asin = headers.index("asin")
+        idx_keyword = headers.index("keyword")
+        idx_date = headers.index("date")
+        idx_time = headers.index("time")
+        idx_type = headers.index("rank_type")
+        idx_rank = headers.index("rank")
+
+        history = []
+        for row in rows[1:]:
+            if len(row) <= max(idx_asin, idx_keyword):
+                continue
+            
+            row_asin = str(row[idx_asin]).strip()
+            row_kw = str(row[idx_keyword]).strip()
+
+            if row_asin == asin and row_kw == keyword:
+                history.append({
+                    "date": row[idx_date],
+                    "time": row[idx_time],
+                    "type": row[idx_type],
+                    "rank": int(row[idx_rank]) if str(row[idx_rank]).isdigit() else row[idx_rank]
+                })
+
+        # 按时间排序并取最后 limit 条
+        history.reverse()
+        return history[:limit]
+    except Exception as e:
+        print(f"[ERROR] Failed to get history: {e}")
+        return []
+
+
 # =========================
 # Amazon 搜索页面（支持翻页和邮编模拟）
 # =========================
@@ -191,7 +301,7 @@ def extract_organic_rank(soup: BeautifulSoup, asin: str, offset: int = 0) -> int
         asin_found = r.get("data-asin")
         if not asin_found:
             continue
-
+        
         # 跳过广告位
         classes = " ".join(r.get("class", []))
         if "AdHolder" in classes or "sp-sponsored-result" in classes:
@@ -214,7 +324,7 @@ def extract_organic_rank(soup: BeautifulSoup, asin: str, offset: int = 0) -> int
 # =========================
 def extract_ad_rank(soup: BeautifulSoup, asin: str, offset: int = 0) -> int | None:
     ads = soup.select("div[data-component-type='s-search-result'], div.AdHolder")
-
+    
     rank_in_page = 1
     for ad in ads:
         asin_found = ad.get("data-asin")
@@ -406,6 +516,120 @@ def _append_logs_to_lark(
         return {"success": False, "message": str(e), "updated_cells": 0}
 
 
+def add_keyword_to_master(brand: str, asin: str, product: str, keyword: str, sheet_title: str = "Master") -> dict:
+    """向飞书 Master 表追加一行新词记录"""
+    spreadsheet_token = get_env("FEISHU_KEYWORD_SHEET_TOKEN") or get_env("FEISHU_SHEET_TOKEN")
+    token = _get_tenant_access_token()
+    sheet_id = _resolve_sheet_id(token, spreadsheet_token, sheet_title)
+    
+    if not spreadsheet_token:
+        return {"success": False, "message": "未配置 FEISHU_SHEET_TOKEN"}
+
+    try:
+        data = {
+            "valueRange": {
+                "values": [[brand, asin, product, keyword]]
+            }
+        }
+        # 使用写维度 API
+        _append_data(token, spreadsheet_token, sheet_id, data)
+        return {"success": True, "message": f"关键词 '{keyword}' 已成功添加到 Master 表"}
+    except Exception as e:
+        return {"success": False, "message": f"添加失败: {str(e)}"}
+
+
+def delete_keyword_from_master(asin: str, keyword: str, sheet_title: str = "Master") -> dict:
+    """根据 ASIN 和关键词查找并删除 Master 表中的对应行"""
+    spreadsheet_token = get_env("FEISHU_KEYWORD_SHEET_TOKEN") or get_env("FEISHU_SHEET_TOKEN")
+    token = _get_tenant_access_token()
+    sheet_id = _resolve_sheet_id(token, spreadsheet_token, sheet_title)
+    
+    # 获取前 1000 行
+    res_raw = _batch_get(token, spreadsheet_token, [f"{sheet_id}!A1:Z1000"])
+    rows = res_raw.get("data", {}).get("valueRanges", [{}])[0].get("values", [])
+    if not rows: return {"success": False, "message": "Master 表为空"}
+
+    headers = [str(h or "").lower().strip() for h in rows[0]]
+    if "asin" not in headers or "keyword" not in headers:
+        return {"success": False, "message": "表头缺失 ASIN 或 KEYWORD"}
+    idx_a, idx_k = headers.index("asin"), headers.index("keyword")
+
+    import re
+    def _clean(s: str) -> str: return re.sub(r'\s+', '', str(s or "")).lower()
+    t_a_c, t_k_c = _clean(asin), _clean(keyword)
+
+    target_idx, last_a = -1, ""
+    for i, row in enumerate(rows):
+        if i == 0: continue
+        rl = len(row)
+        ca = _extract_text(row[idx_a]).strip() if idx_a < rl else ""
+        if ca: last_a = ca
+        if _clean(last_a) == t_a_c and _clean(_extract_text(row[idx_k]).strip() if idx_k < rl else "") == t_k_c:
+            target_idx = i
+            break
+            
+    if target_idx == -1: return {"success": False, "message": f"未找到匹配项: {asin} / {keyword}"}
+
+    try:
+        # 保护逻辑：如果被删除行定义了归类信息，而下一行是空的依赖行
+        # 我们需要先将这些信息写入下一行，防止其认错祖宗
+        row_to_del = rows[target_idx]
+        b_val = _extract_text(row_to_del[0]).strip() if len(row_to_del) > 0 else ""
+        a_val = _extract_text(row_to_del[idx_a]).strip() if idx_a < len(row_to_del) else ""
+        p_val = _extract_text(row_to_del[2]).strip() if len(row_to_del) > 2 else ""
+        
+        if (a_val or b_val) and (target_idx + 1 < len(rows)):
+            next_row = rows[target_idx + 1]
+            na = _extract_text(next_row[idx_a]).strip() if idx_a < len(next_row) else ""
+            if not na:
+                # 把遗产（品牌、ASIN、产品名）留给下一行
+                # 确定 B, A, P 的具体列（假设是前三列 A, B, C）
+                _batch_update(token, spreadsheet_token, [{
+                    "range": f"{sheet_id}!A{target_idx + 2}:C{target_idx + 2}",
+                    "values": [[b_val, a_val, p_val]]
+                }])
+
+        url = f"{LARK_HOST}/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/dimension_range"
+        payload = {"dimension": {"sheetId": sheet_id, "majorDimension": "ROWS", "startIndex": target_idx, "endIndex": target_idx + 1}}
+        import requests
+        res = requests.delete(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=payload)
+        if res.json().get("code") == 0: return {"success": True, "message": f"关键词 '{keyword}' 已删除"}
+        return {"success": False, "message": "飞书 API 删除失败"}
+    except Exception as e: return {"success": False, "message": str(e)}
+
+def add_keyword_to_master(asin: str, keyword: str, brand: str = "", product: str = "", sheet_title: str = "Master") -> dict:
+    """录入新词，支持手动指定品牌/产品，否则自动在 Master 表中寻找"""
+    spreadsheet_token = get_env("FEISHU_KEYWORD_SHEET_TOKEN") or get_env("FEISHU_SHEET_TOKEN")
+    token = _get_tenant_access_token()
+    sheet_id = _resolve_sheet_id(token, spreadsheet_token, sheet_title)
+    
+    # 如果品牌或产品为空，且表格中有数据，尝试自动找补
+    if not (brand and product):
+        res_raw = _batch_get(token, spreadsheet_token, [f"{sheet_id}!A1:Z500"])
+        rows = res_raw.get("data", {}).get("valueRanges", [{}])[0].get("values", [])
+        if rows:
+            h = [str(col or "").lower().strip() for col in rows[0]]
+            if "brand" in h and "asin" in h and "product" in h:
+                i_b, i_a, i_p = h.index("brand"), h.index("asin"), h.index("product")
+                l_b, l_p = "", ""
+                for row in rows[1:]:
+                    rl = len(row)
+                    cb = _extract_text(row[i_b]).strip() if i_b < rl else ""
+                    ca = _extract_text(row[i_a]).strip() if i_a < rl else ""
+                    cp = _extract_text(row[i_p]).strip() if i_p < rl else ""
+                    if cb: l_b = cb
+                    if cp: l_p = cp
+                    if ca.lower() == asin.lower():
+                        if not brand: brand = l_b
+                        if not product: product = l_p
+                        break
+
+    # 追加新行
+    new_row = [brand, asin, product, keyword]
+    _append_data(token, spreadsheet_token, sheet_id, {"valueRange": {"values": [[brand, asin, product, keyword]]}})
+    return {"success": True, "message": f"关键词 '{keyword}' 已录入（归类：{brand or '未知'}）"}
+
+
 # =========================
 # 对外入口：关键词追踪并写入飞书
 # =========================
@@ -514,6 +738,63 @@ def run_keyword_tracking(sheet_title: str = None, dry_run: bool = False) -> dict
     }
 
 
+def run_keyword_tracking_generator(sheet_title: str = None):
+    """
+    流式的关键词追踪，实时 yield 进度。
+    """
+    start_time_str = datetime.now(JST).strftime("%H:%M:%S")
+    
+    yield {"type": "progress", "message": "正在从飞书加载关键词配置..."}
+    keywords = load_keywords_from_lark()
+    if not keywords:
+        yield {"type": "error", "message": "未能加载关键词配置", "updated_cells": 0}
+        return
+
+    yield {"type": "progress", "message": f"共找到 {len(keywords)} 个关键词待追踪，开始执行..."}
+
+    by_brand: dict[str, list[dict[str, Any]]] = {}
+    total_count = len(keywords)
+
+    for i, k in enumerate(keywords):
+        yield {"type": "heartbeat"}
+        brand = (k.get("brand") or "").strip() or "UNKNOWN"
+        asin = k.get("asin", "")
+        product = k.get("product", "")
+        keyword = k.get("keyword", "")
+
+        if not asin or not keyword:
+            continue
+
+        log_msg = f"[{i+1}/{total_count}] 正在抓取: {asin} | {keyword}"
+        print(log_msg)
+        yield {"type": "progress", "message": log_msg}
+
+        organic_rank, ad_rank = get_ranks(keyword, asin)
+
+        by_brand.setdefault(brand, []).append(
+            create_log(brand, asin, product, keyword, "organic", organic_rank, start_time=start_time_str)
+        )
+        by_brand.setdefault(brand, []).append(
+            create_log(brand, asin, product, keyword, "ad", ad_rank, start_time=start_time_str)
+        )
+
+        time.sleep(random.uniform(2, 4))
+
+    all_logs = [log for logs in by_brand.values() for log in logs]
+    if not all_logs:
+        yield {"type": "done", "message": "没有生成任何记录", "updated_cells": 0}
+        return
+
+    dest_sheet = sheet_title or (get_env("FEISHU_KEYWORD_SHEET_NAME") or "KW追踪")
+    yield {"type": "progress", "message": f"抓取完成，正在写入飞书 '{dest_sheet}'..."}
+    
+    res = _append_logs_to_lark(all_logs, sheet_title=dest_sheet)
+    if res["success"]:
+        yield {"type": "done", "message": res["message"], "updated_cells": res["updated_cells"]}
+    else:
+        yield {"type": "error", "message": res["message"], "updated_cells": 0}
+
+
 # =========================
 # 兼容：本地运行仍写 CSV
 # =========================
@@ -568,7 +849,7 @@ def main():
 
     df = pd.DataFrame(logs)
     log_path = os.path.join(BASE_DIR, "rank_log.csv")
-
+    
     header = not os.path.exists(log_path)
     df.to_csv(log_path, mode="a", header=header, index=False)
 
