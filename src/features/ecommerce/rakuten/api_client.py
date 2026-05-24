@@ -1,23 +1,63 @@
 import base64
 import os
+import re
 import requests
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
 
 from src.core.config_manager import get_env
+
+
+def _store_env_prefix(store_id: str | None) -> str:
+    if not store_id or store_id == "default":
+        return ""
+    return re.sub(r"[^A-Z0-9]+", "_", store_id.upper()).strip("_")
+
+
+def _get_store_env(
+    prefix: str,
+    suffix: str,
+    fallback_key: str,
+    default: str,
+    require_store_specific: bool = False,
+) -> str:
+    if prefix:
+        store_key = f"RAKUTEN_{prefix}_{suffix}"
+        value = get_env(store_key, "") or ""
+        if value:
+            return value
+        if require_store_specific:
+            raise RuntimeError(f"{store_key} is not configured")
+    return get_env(fallback_key, default) or default
 
 
 @dataclass
 class RakutenApiClient:
     api_key: str = ""      # "serviceSecret:licenseKey" の形式
     shop_id: str = ""
+    shop_id: str = ""
     base_url: str = ""
+    store_id: str = "default"
 
     def __post_init__(self):
-        self.api_key = self.api_key or get_env("RAKUTEN_API_KEY", "")
-        self.shop_id = self.shop_id or get_env("RAKUTEN_SHOP_ID", "")
-        self.base_url = self.base_url or get_env("RAKUTEN_BASE_URL", "https://api.rms.rakuten.co.jp")
+        prefix = _store_env_prefix(self.store_id)
+        require_store_specific = bool(prefix)
+        self.api_key = self.api_key or _get_store_env(
+            prefix,
+            "API_KEY",
+            "RAKUTEN_API_KEY",
+            "",
+            require_store_specific=require_store_specific,
+        )
+        self.shop_id = self.shop_id or _get_store_env(
+            prefix,
+            "SHOP_ID",
+            "RAKUTEN_SHOP_ID",
+            "",
+            require_store_specific=require_store_specific,
+        )
+        self.base_url = self.base_url or _get_store_env(prefix, "BASE_URL", "RAKUTEN_BASE_URL", "https://api.rms.rakuten.co.jp")
 
     def _get_auth_header(self) -> str:
         """
@@ -88,6 +128,71 @@ class RakutenApiClient:
         resp = requests.post(endpoint, headers=self._get_headers(), json=payload, timeout=30)
         resp.raise_for_status()
         return resp.json()
+
+    def get_orders_detailed(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
+        """Fetch Rakuten orders and flatten item details for Bitable sync."""
+        if not self.api_key:
+            raise RuntimeError(f"Rakuten API key is not configured for store '{self.store_id}'")
+
+        order_numbers: list[str] = []
+        seen_order_numbers: set[str] = set()
+        for range_start, range_end in self._iter_search_ranges(start_date, end_date):
+            page = 1
+            while True:
+                result = self.search_orders(range_start, range_end, page)
+                for order_number in result.get("orderNumberList") or []:
+                    if order_number not in seen_order_numbers:
+                        order_numbers.append(order_number)
+                        seen_order_numbers.add(order_number)
+                pagination = result.get("PaginationResponseModel") or {}
+                total_pages = int(pagination.get("totalPages") or 1)
+                if page >= total_pages:
+                    break
+                page += 1
+
+        orders: list[dict[str, Any]] = []
+        for i in range(0, len(order_numbers), 100):
+            detail = self.get_order_items(order_numbers[i:i + 100])
+            for raw in detail.get("OrderModelList") or []:
+                order = {
+                    "orderNumber": raw.get("orderNumber"),
+                    "orderDatetime": raw.get("orderDatetime"),
+                    "requestPrice": raw.get("requestPrice"),
+                    "totalPrice": raw.get("totalPrice"),
+                    "shippingFee": raw.get("postagePrice") or raw.get("shippingFee"),
+                    "ordererName": raw.get("ordererName") or raw.get("ordererName1"),
+                    "ordererPrefecture": raw.get("ordererPrefecture"),
+                    "settlementMethod": raw.get("settlementMethod"),
+                    "orderStatus": raw.get("orderStatus"),
+                    "orderProgressCode": raw.get("orderProgressCode") or raw.get("orderProgress"),
+                    "items": [],
+                }
+                for package in raw.get("PackageModelList") or []:
+                    for item in package.get("ItemModelList") or []:
+                        sku_model = (item.get("SkuModelList") or [{}])[0]
+                        order["items"].append({
+                            "manageNumber": item.get("manageNumber"),
+                            "itemNumber": item.get("itemNumber"),
+                            "itemName": item.get("itemName"),
+                            "systemSku": sku_model.get("merchantDefinedSkuId") or item.get("systemSku"),
+                            "variantId": sku_model.get("variantId"),
+                            "units": item.get("units"),
+                            "price": item.get("price"),
+                        })
+                orders.append(order)
+        return orders
+
+    @staticmethod
+    def _iter_search_ranges(start_date: str, end_date: str, max_days: int = 31) -> list[tuple[str, str]]:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        ranges: list[tuple[str, str]] = []
+        cursor = start
+        while cursor <= end:
+            chunk_end = min(cursor + timedelta(days=max_days - 1), end)
+            ranges.append((cursor.isoformat(), chunk_end.isoformat()))
+            cursor = chunk_end + timedelta(days=1)
+        return ranges
 
     def get_sales_data(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
         """
