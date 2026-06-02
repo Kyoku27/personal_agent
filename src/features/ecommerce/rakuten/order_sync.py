@@ -22,7 +22,20 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "status": ("\u6ce8\u6587\u30b9\u30c6\u30fc\u30bf\u30b9", "\u30b9\u30c6\u30fc\u30bf\u30b9"),
     "reference_code": ("\u53c2\u7167\u30b3\u30fc\u30c9", "\u53c2\u8003code", "orderProgressCode"),
     "month_tag": ("\u6708", "\u6708\u5225", "\u5bfe\u8c61\u6708Tag"),
+    "sex": ("\u6027\u5225", "sex", "gender"),
+    "birth_year": ("\u51fa\u751f\u5e74", "\u751f\u5e74", "birthYear"),
+    "age_bucket": ("\u5e74\u9f62\u6bb5", "\u5e74\u4ee3", "ageBucket"),
+    "purchase_hour": ("\u8cfc\u5165\u6642", "\u8cfc\u5165\u6642\u9593", "\u6ce8\u6587\u6642", "purchaseHour"),
+    "purchase_time_range": ("\u8cfc\u5165\u6642\u9593\u5e2f", "\u6642\u9593\u5e2f", "purchaseTimeRange"),
 }
+
+PROFILE_FIELD_DEFINITIONS: list[dict[str, Any]] = [
+    {"field_name": "\u6027\u5225", "type": 1},
+    {"field_name": "\u51fa\u751f\u5e74", "type": 1},
+    {"field_name": "\u5e74\u9f62\u6bb5", "type": 1},
+    {"field_name": "\u8cfc\u5165\u6642", "type": 1},
+    {"field_name": "\u8cfc\u5165\u6642\u9593\u5e2f", "type": 1},
+]
 
 
 def _find_field(columns: list[str], aliases: tuple[str, ...]) -> str | None:
@@ -93,6 +106,42 @@ def _order_date(value: Any) -> date | None:
     return dt.astimezone(JST).date() if dt else None
 
 
+def _purchase_hour(value: Any) -> str:
+    dt = _parse_datetime(value)
+    return f"{dt.astimezone(JST).hour:02d}" if dt else ""
+
+
+def _purchase_time_range(value: Any) -> str:
+    hour = _purchase_hour(value)
+    return f"{hour}:00-{hour}:59" if hour else ""
+
+
+def _as_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _age_bucket(order_datetime: Any, birth_year: Any, birth_month: Any = None, birth_day: Any = None) -> str:
+    year = _as_int(birth_year)
+    if not year:
+        return ""
+    order_day = _order_date(order_datetime) or date.today()
+    age = order_day.year - year
+    month = _as_int(birth_month)
+    day = _as_int(birth_day)
+    if month and day and (order_day.month, order_day.day) < (month, day):
+        age -= 1
+    if age < 0:
+        return ""
+    if age < 10:
+        return "10\u6b73\u672a\u6e80"
+    return f"{(age // 10) * 10}\u4ee3"
+
+
 def build_records(orders: list[dict[str, Any]], columns: list[str], granularity: str | None = None) -> list[tuple[dict[str, Any], dict[str, str]]]:
     mapping = build_column_mapping(columns)
     granularity = granularity or decide_granularity(columns)
@@ -114,6 +163,22 @@ def build_records(orders: list[dict[str, Any]], columns: list[str], granularity:
         _set(base_fields, mapping, "status", order.get("orderStatus"))
         _set(base_fields, mapping, "reference_code", order.get("orderProgressCode"))
         _set(base_fields, mapping, "month_tag", month_tag)
+        _set(base_fields, mapping, "sex", order.get("ordererSex"))
+        birth_year = order.get("ordererBirthYear")
+        _set(base_fields, mapping, "birth_year", str(birth_year) if birth_year not in (None, "") else "")
+        _set(
+            base_fields,
+            mapping,
+            "age_bucket",
+            _age_bucket(
+                order_date_value,
+                order.get("ordererBirthYear"),
+                order.get("ordererBirthMonth"),
+                order.get("ordererBirthDay"),
+            ),
+        )
+        _set(base_fields, mapping, "purchase_hour", _purchase_hour(order_date_value))
+        _set(base_fields, mapping, "purchase_time_range", _purchase_time_range(order_date_value))
 
         if granularity == "per_order":
             records.append((base_fields, {"order_number": order_no, "sku": ""}))
@@ -121,7 +186,7 @@ def build_records(orders: list[dict[str, Any]], columns: list[str], granularity:
 
         for item in order.get("items") or [{}]:
             fields = dict(base_fields)
-            sku = str(item.get("manageNumber") or item.get("itemNumber") or "").strip()
+            sku = str(item.get("variantId") or item.get("systemSku") or item.get("manageNumber") or item.get("itemNumber") or "").strip()
             item_name = str(item.get("itemName") or "").strip()
             qty = item.get("units") or 1
             price = item.get("price") or 0
@@ -135,5 +200,6 @@ def build_records(orders: list[dict[str, Any]], columns: list[str], granularity:
             _set(fields, mapping, "qty", qty)
             _set(fields, mapping, "unit_price", price)
             _set(fields, mapping, "subtotal", subtotal)
-            records.append((fields, {"order_number": order_no, "sku": sku or item_name}))
+            system_sku = str(item.get("systemSku") or "").strip()
+            records.append((fields, {"order_number": order_no, "sku": system_sku or sku or item_name}))
     return records

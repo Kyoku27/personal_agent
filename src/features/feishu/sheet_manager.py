@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,6 +35,36 @@ class FeishuSheetManager:
             raise RuntimeError(f"Lark list records failed: {data}")
         items = (data.get("data") or {}).get("items") or []
         return list((items[0].get("fields") or {}).keys()) if items else []
+
+    def create_table_field(self, app_token: str, table_id: str, field: dict[str, Any]) -> str:
+        headers = self._headers()
+        url = f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
+        payload: dict[str, Any] = {
+            "field_name": field["field_name"],
+            "type": field["type"],
+        }
+        if field.get("property"):
+            payload["property"] = field["property"]
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        if not resp.ok:
+            raise RuntimeError(f"Lark API HTTP {resp.status_code} create field {field.get('field_name')}: {resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Lark create field {field.get('field_name')} failed: {data}")
+        created = data.get("data") or {}
+        return str(created.get("field_id") or (created.get("field") or {}).get("field_id") or "")
+
+    def ensure_table_fields(self, app_token: str, table_id: str, fields: list[dict[str, Any]]) -> list[str]:
+        existing = set(self.list_table_fields(app_token, table_id))
+        created: list[str] = []
+        for field in fields:
+            field_name = str(field.get("field_name") or "")
+            if not field_name or field_name in existing:
+                continue
+            self.create_table_field(app_token, table_id, field)
+            existing.add(field_name)
+            created.append(field_name)
+        return created
 
     def list_bitable_records(self, app_token: str, table_id: str, page_size: int = 500) -> list[dict[str, Any]]:
         headers = self._headers()
@@ -89,6 +120,8 @@ class FeishuSheetManager:
             return FeishuSheetManager._normalize_value(value[0])
         if isinstance(value, dict):
             return value.get("text") or value.get("name") or value.get("value") or value
+        if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+            return int(value.strip())
         return value
 
     @classmethod
@@ -101,7 +134,15 @@ class FeishuSheetManager:
     @staticmethod
     def _existing_key(fields: dict[str, Any]) -> str | None:
         order_no = str(fields.get("\u6ce8\u6587\u756a\u53f7") or fields.get("\u53d7\u6ce8\u756a\u53f7") or "").strip()
-        sku = str(fields.get("\u5546\u54c1\u7ba1\u7406\u756a\u53f7") or fields.get("SKU\u7ba1\u7406\u756a\u53f7") or fields.get("SKU") or fields.get("\u5546\u54c1\u540d") or "").strip()
+        sku = str(
+            fields.get("\u30b7\u30b9\u30c6\u30e0\u9023\u643a\u7528SKU\u756a\u53f7")
+            or fields.get("\u30b7\u30b9\u30c6\u30e0SKU")
+            or fields.get("\u5546\u54c1\u7ba1\u7406\u756a\u53f7")
+            or fields.get("SKU\u7ba1\u7406\u756a\u53f7")
+            or fields.get("SKU")
+            or fields.get("\u5546\u54c1\u540d")
+            or ""
+        ).strip()
         return f"{order_no}|{sku}" if order_no else None
 
     def bitable_bulk_upsert_records(self, app_token: str, table_id: str, records: list[tuple[dict[str, Any], dict[str, str]]], dry_run: bool = False) -> dict[str, int]:

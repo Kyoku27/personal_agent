@@ -154,14 +154,19 @@ class RakutenApiClient:
         for i in range(0, len(order_numbers), 100):
             detail = self.get_order_items(order_numbers[i:i + 100])
             for raw in detail.get("OrderModelList") or []:
+                orderer = raw.get("OrdererModel") or {}
                 order = {
                     "orderNumber": raw.get("orderNumber"),
                     "orderDatetime": raw.get("orderDatetime"),
                     "requestPrice": raw.get("requestPrice"),
                     "totalPrice": raw.get("totalPrice"),
                     "shippingFee": raw.get("postagePrice") or raw.get("shippingFee"),
-                    "ordererName": raw.get("ordererName") or raw.get("ordererName1"),
-                    "ordererPrefecture": raw.get("ordererPrefecture"),
+                    "ordererName": raw.get("ordererName") or raw.get("ordererName1") or orderer.get("name"),
+                    "ordererPrefecture": raw.get("ordererPrefecture") or orderer.get("prefecture"),
+                    "ordererSex": orderer.get("sex"),
+                    "ordererBirthYear": orderer.get("birthYear"),
+                    "ordererBirthMonth": orderer.get("birthMonth"),
+                    "ordererBirthDay": orderer.get("birthDay"),
                     "settlementMethod": raw.get("settlementMethod"),
                     "orderStatus": raw.get("orderStatus"),
                     "orderProgressCode": raw.get("orderProgressCode") or raw.get("orderProgress"),

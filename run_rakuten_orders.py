@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import re
 import os
+from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import Any
 
 from src.core.config_manager import get_env
 from src.features.ecommerce.rakuten.api_client import RakutenApiClient
-from src.features.ecommerce.rakuten.order_sync import build_records, decide_granularity
+from src.features.ecommerce.rakuten.order_sync import PROFILE_FIELD_DEFINITIONS, build_records, decide_granularity
+from src.features.ecommerce.rakuten.sales_targets import update_sales_target_actuals
 from src.features.feishu.bot_client import FeishuBotClient
 from src.features.feishu.sheet_manager import FeishuSheetManager
 from src.features.feishu.wiki_resolver import resolve_wiki_to_bitable
@@ -54,6 +56,33 @@ def _resolve_range(date_str: str | None = None, start_date: str | None = None, e
     return start.isoformat(), end.isoformat()
 
 
+def _profile_summary(records: list[tuple[dict[str, Any], dict[str, str]]]) -> dict[str, Any]:
+    sex = Counter()
+    age_bucket = Counter()
+    purchase_hour = Counter()
+    purchase_time_range = Counter()
+    present = Counter()
+    for fields, _ in records:
+        for field_name, counter in (
+            ("\u6027\u5225", sex),
+            ("\u5e74\u9f62\u6bb5", age_bucket),
+            ("\u8cfc\u5165\u6642", purchase_hour),
+            ("\u8cfc\u5165\u6642\u9593\u5e2f", purchase_time_range),
+        ):
+            value = fields.get(field_name)
+            if value in (None, ""):
+                continue
+            present[field_name] += 1
+            counter[str(value)] += 1
+    return {
+        "fields_present_rows": dict(present),
+        "sex_counts": dict(sex),
+        "age_bucket_counts": dict(age_bucket),
+        "purchase_hour_counts": dict(sorted(purchase_hour.items())),
+        "purchase_time_range_counts": dict(sorted(purchase_time_range.items())),
+    }
+
+
 def run_rakuten_orders_sync(
     date_str: str | None = None,
     start_date: str | None = None,
@@ -82,6 +111,7 @@ def run_rakuten_orders_sync(
         direct_app_token=_store_env(store_id, "BITABLE_APP_TOKEN", "FEISHU_RAKUTEN_BITABLE_APP_TOKEN"),
     )
     sheet_manager = FeishuSheetManager(client=FeishuBotClient(bot_token=get_env("FEISHU_BOT_TOKEN", "") or "dummy"))
+    created_fields = sheet_manager.ensure_table_fields(app_token, table_id, PROFILE_FIELD_DEFINITIONS)
     columns = sheet_manager.list_table_fields(app_token, table_id)
     granularity = decide_granularity(columns)
     if inspect:
@@ -90,6 +120,7 @@ def run_rakuten_orders_sync(
             "message": f"Target table schema loaded: {len(columns)} columns",
             "store_id": store_id,
             "columns": columns,
+            "created_fields": created_fields,
             "granularity": granularity,
         }
 
@@ -97,6 +128,13 @@ def run_rakuten_orders_sync(
     orders = RakutenApiClient(store_id=store_id).get_orders_detailed(start, end)
     records = build_records(orders, columns, granularity=granularity)
     result = sheet_manager.bitable_bulk_upsert_records(app_token, table_id, records, dry_run=dry_run)
+    sales_target_actuals: dict[str, Any] | None = None
+    warnings: dict[str, str] = {}
+    if not dry_run and not _store_env_prefix(store_id):
+        try:
+            sales_target_actuals = update_sales_target_actuals(app_token, table_id, target_year=_parse_date(start, "start_date").year)
+        except Exception as exc:
+            warnings["sales_target_actuals"] = str(exc)
     preview = [{"keys": key_fields, "fields": fields} for fields, key_fields in records[:5]]
     action = "Dry-run finished" if dry_run else "Sync finished"
     return {
@@ -108,7 +146,10 @@ def run_rakuten_orders_sync(
         "granularity": granularity,
         "orders_count": len(orders),
         "rows_count": len(records),
-        "warnings": {},
+        "created_fields": created_fields,
+        "profile_summary": _profile_summary(records),
+        "warnings": warnings,
+        "sales_target_actuals": sales_target_actuals,
         "preview": preview if dry_run else [],
         **result,
     }

@@ -8,19 +8,20 @@ import requests
 
 from src.core.config_manager import get_env
 from src.features.feishu.bot_client import FEISHU_BASE_URL, _get_tenant_access_token
+from src.features.feishu.user_oauth import refresh_user_access_token
 from src.features.feishu.wiki_resolver import resolve_wiki_to_bitable
 
 JST = timezone(timedelta(hours=9))
 DAILY_VIEW_NAMES = ["HRP", "MOFT", "CZUR", "Genki", "Hidock", "DB"]
 DAILY_TEMPLATE_STORES = {
-    "default": {"label": "EZLIFE", "wiki_env": "FEISHU_RAKUTEN_WIKI_NODE_TOKEN"},
-    "ezlife": {"label": "EZLIFE", "wiki_env": "FEISHU_RAKUTEN_WIKI_NODE_TOKEN"},
-    "store2": {"label": "tomtoc", "wiki_env": "FEISHU_RAKUTEN_STORE2_WIKI_NODE_TOKEN"},
-    "tomtoc": {"label": "tomtoc", "wiki_env": "FEISHU_RAKUTEN_STORE2_WIKI_NODE_TOKEN"},
+    "default": {"label": "EZLIFE", "wiki_env": "FEISHU_RAKUTEN_WIKI_NODE_TOKEN", "view_names": DAILY_VIEW_NAMES},
+    "ezlife": {"label": "EZLIFE", "wiki_env": "FEISHU_RAKUTEN_WIKI_NODE_TOKEN", "view_names": DAILY_VIEW_NAMES},
+    "store2": {"label": "tomtoc", "wiki_env": "FEISHU_RAKUTEN_STORE2_WIKI_NODE_TOKEN", "view_names": ["DB"]},
+    "tomtoc": {"label": "tomtoc", "wiki_env": "FEISHU_RAKUTEN_STORE2_WIKI_NODE_TOKEN", "view_names": ["DB"]},
 }
 
 
-def _store_config(store_id: str | None) -> dict[str, str]:
+def _store_config(store_id: str | None) -> dict[str, Any]:
     normalized = (store_id or "default").strip().lower()
     config = DAILY_TEMPLATE_STORES.get(normalized)
     if not config:
@@ -29,12 +30,12 @@ def _store_config(store_id: str | None) -> dict[str, str]:
     return config
 
 
-def _resolve_daily_app_token(store_id: str | None) -> tuple[str, str]:
+def _resolve_daily_app_token(store_id: str | None) -> tuple[str, dict[str, Any]]:
     config = _store_config(store_id)
     wiki_node_token = get_env(config["wiki_env"], "") or ""
     if not wiki_node_token:
         raise RuntimeError(f"{config['wiki_env']} is not configured for {config['label']} daily template copy.")
-    return resolve_wiki_to_bitable(wiki_node_token), config["label"]
+    return resolve_wiki_to_bitable(wiki_node_token), config
 
 
 def _parse_month(month: str) -> tuple[int, int]:
@@ -62,6 +63,15 @@ def _auth_headers(prefer_user: bool = True) -> dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
     }
+
+
+def _lark_request(method: str, url: str, prefer_user: bool = True, **kwargs: Any) -> requests.Response:
+    headers = kwargs.pop("headers", None) or _auth_headers(prefer_user=prefer_user)
+    resp = requests.request(method, url, headers=headers, **kwargs)
+    if prefer_user and resp.status_code == 401 and "expired" in resp.text.lower():
+        refresh_user_access_token()
+        resp = requests.request(method, url, headers=_auth_headers(prefer_user=True), **kwargs)
+    return resp
 
 
 def _raise_lark_error(resp: requests.Response, action: str) -> None:
@@ -107,7 +117,7 @@ def _list_tables(app_token: str, prefer_user: bool = True) -> list[dict[str, Any
         params: dict[str, Any] = {"page_size": 100}
         if page_token:
             params["page_token"] = page_token
-        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        resp = _lark_request("GET", url, headers=headers, prefer_user=prefer_user, params=params, timeout=15)
         if not resp.ok:
             _raise_lark_error(resp, "GET tables")
         data = resp.json()
@@ -130,7 +140,7 @@ def _list_fields(app_token: str, table_id: str, prefer_user: bool = True) -> lis
         params: dict[str, Any] = {"page_size": 200}
         if page_token:
             params["page_token"] = page_token
-        resp = requests.get(url, headers=headers, params=params, timeout=20)
+        resp = _lark_request("GET", url, headers=headers, prefer_user=prefer_user, params=params, timeout=20)
         if not resp.ok:
             _raise_lark_error(resp, "GET fields")
         data = resp.json()
@@ -147,7 +157,7 @@ def _list_fields(app_token: str, table_id: str, prefer_user: bool = True) -> lis
 def _list_views(app_token: str, table_id: str, prefer_user: bool = True) -> list[dict[str, Any]]:
     headers = _auth_headers(prefer_user=prefer_user)
     url = f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/views"
-    resp = requests.get(url, headers=headers, params={"page_size": 100}, timeout=20)
+    resp = _lark_request("GET", url, headers=headers, prefer_user=prefer_user, params={"page_size": 100}, timeout=20)
     if not resp.ok:
         _raise_lark_error(resp, "GET views")
     data = resp.json()
@@ -159,7 +169,7 @@ def _list_views(app_token: str, table_id: str, prefer_user: bool = True) -> list
 def _create_view(app_token: str, table_id: str, view_name: str, prefer_user: bool = True) -> None:
     headers = _auth_headers(prefer_user=prefer_user)
     url = f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/views"
-    resp = requests.post(url, headers=headers, json={"view_name": view_name, "view_type": "grid"}, timeout=20)
+    resp = _lark_request("POST", url, headers=headers, prefer_user=prefer_user, json={"view_name": view_name, "view_type": "grid"}, timeout=20)
     if not resp.ok:
         _raise_lark_error(resp, f"create view {view_name}")
     data = resp.json()
@@ -167,11 +177,16 @@ def _create_view(app_token: str, table_id: str, view_name: str, prefer_user: boo
         raise RuntimeError(f"Lark create view {view_name} failed: {data}")
 
 
-def _ensure_daily_views(app_token: str, table_id: str, prefer_user: bool = True) -> list[str]:
+def _ensure_daily_views(
+    app_token: str,
+    table_id: str,
+    prefer_user: bool = True,
+    view_names: list[str] | None = None,
+) -> list[str]:
     views = _list_views(app_token, table_id, prefer_user=prefer_user)
     existing = {str(view.get("view_name") or "") for view in views}
     created: list[str] = []
-    for view_name in DAILY_VIEW_NAMES:
+    for view_name in view_names or DAILY_VIEW_NAMES:
         if view_name in existing:
             continue
         _create_view(app_token, table_id, view_name, prefer_user=prefer_user)
@@ -188,9 +203,11 @@ def _create_table(app_token: str, table_name: str, primary_field: dict[str, Any]
     }
     if primary_field.get("property"):
         field_payload["property"] = primary_field["property"]
-    resp = requests.post(
+    resp = _lark_request(
+        "POST",
         url,
         headers=headers,
+        prefer_user=prefer_user,
         json={"table": {"name": table_name, "default_view_name": "表格", "fields": [field_payload]}},
         timeout=30,
     )
@@ -211,7 +228,7 @@ def _create_field(app_token: str, table_id: str, field: dict[str, Any], prefer_u
     }
     if field.get("property"):
         payload["property"] = field["property"]
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    resp = _lark_request("POST", url, headers=headers, prefer_user=prefer_user, json=payload, timeout=30)
     if not resp.ok:
         _raise_lark_error(resp, f"create field {field.get('field_name')}")
     data = resp.json()
@@ -230,7 +247,7 @@ def _update_field(app_token: str, table_id: str, field_id: str, field: dict[str,
     }
     if field.get("property"):
         payload["property"] = field["property"]
-    resp = requests.put(url, headers=headers, json=payload, timeout=30)
+    resp = _lark_request("PUT", url, headers=headers, prefer_user=prefer_user, json=payload, timeout=30)
     if not resp.ok:
         _raise_lark_error(resp, f"update field {field.get('field_name')}")
     data = resp.json()
@@ -288,6 +305,25 @@ def _date_formula_field(field: dict[str, Any]) -> dict[str, Any]:
     }
     if day:
         copied["property"]["formula_expression"] = f"DATE(YEAR([対象月]),MONTH([対象月]),{int(day)})"
+    return copied
+
+
+def _formula_field(field: dict[str, Any], target_month: str | None = None) -> dict[str, Any]:
+    copied = {
+        "field_id": field["field_id"],
+        "field_name": field["field_name"],
+        "type": field["type"],
+        "property": dict(field.get("property") or {}),
+    }
+    formula = str(copied["property"].get("formula_expression") or "")
+    if target_month and formula:
+        year, month_num = _parse_month(target_month)
+        lower_bound = (datetime(year, month_num, 1, tzinfo=JST) - timedelta(days=1)).strftime("%Y-%m-%d")
+        if month_num == 12:
+            upper_bound = datetime(year + 1, 1, 1, tzinfo=JST).strftime("%Y-%m-%d")
+        else:
+            upper_bound = datetime(year, month_num + 1, 1, tzinfo=JST).strftime("%Y-%m-%d")
+        copied["property"]["formula_expression"] = _replace_date_bounds(formula, lower_bound, upper_bound)
     return copied
 
 
@@ -359,7 +395,12 @@ def _manual_clone_daily_table(
             final_field = _lookup_formula_field(source_field, target_month=target_month)
         elif source_field.get("type") == 20:
             field = _formula_placeholder_field(source_field)
-            final_field = _date_formula_field(source_field)
+            field_name = str(source_field.get("field_name") or "")
+            final_field = (
+                _date_formula_field(source_field)
+                if field_name.endswith("日付")
+                else _formula_field(source_field, target_month=target_month)
+            )
         else:
             field = source_field
             final_field = source_field
@@ -392,7 +433,7 @@ def _rename_table(app_token: str, table_id: str, name: str, prefer_user: bool = 
     url = f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}"
     last_error: dict[str, Any] | None = None
     for _ in range(10):
-        resp = requests.patch(url, headers=headers, json={"name": name}, timeout=15)
+        resp = _lark_request("PATCH", url, headers=headers, prefer_user=prefer_user, json={"name": name}, timeout=15)
         if not resp.ok:
             if _is_copying_error(text=resp.text):
                 time_module.sleep(1)
@@ -440,7 +481,7 @@ def _list_records(app_token: str, table_id: str, prefer_user: bool = True) -> li
         params: dict[str, Any] = {"page_size": 500}
         if page_token:
             params["page_token"] = page_token
-        resp = requests.get(url, headers=headers, params=params, timeout=20)
+        resp = _lark_request("GET", url, headers=headers, prefer_user=prefer_user, params=params, timeout=20)
         if not resp.ok:
             if _is_copying_error(text=resp.text) and copy_waits < 10:
                 copy_waits += 1
@@ -468,7 +509,7 @@ def _batch_update_records(app_token: str, table_id: str, rows: list[dict[str, An
     headers = _auth_headers(prefer_user=prefer_user)
     url = f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update"
     for i in range(0, len(rows), 500):
-        resp = requests.post(url, headers=headers, json={"records": rows[i:i + 500]}, timeout=30)
+        resp = _lark_request("POST", url, headers=headers, prefer_user=prefer_user, json={"records": rows[i:i + 500]}, timeout=30)
         if not resp.ok:
             _raise_lark_error(resp, "batch_update")
         data = resp.json()
@@ -482,7 +523,7 @@ def _batch_create_records(app_token: str, table_id: str, rows: list[dict[str, An
     headers = _auth_headers(prefer_user=prefer_user)
     url = f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create"
     for i in range(0, len(rows), 500):
-        resp = requests.post(url, headers=headers, json={"records": [{"fields": fields} for fields in rows[i:i + 500]]}, timeout=30)
+        resp = _lark_request("POST", url, headers=headers, prefer_user=prefer_user, json={"records": [{"fields": fields} for fields in rows[i:i + 500]]}, timeout=30)
         if not resp.ok:
             _raise_lark_error(resp, "batch_create")
         data = resp.json()
@@ -534,7 +575,8 @@ def _daily_layout_matches(source_fields: list[dict[str, Any]], target_fields: li
 
 
 def inspect_daily_tables(store_id: str | None = None) -> dict[str, Any]:
-    app_token, store_label = _resolve_daily_app_token(store_id)
+    app_token, store_config = _resolve_daily_app_token(store_id)
+    store_label = str(store_config["label"])
     tables = _list_tables(app_token, prefer_user=True)
     return {
         "success": True,
@@ -550,7 +592,9 @@ def prepare_daily_template(
     dry_run: bool = False,
     store_id: str | None = None,
 ) -> dict[str, Any]:
-    app_token, store_label = _resolve_daily_app_token(store_id)
+    app_token, store_config = _resolve_daily_app_token(store_id)
+    store_label = str(store_config["label"])
+    view_names = list(store_config.get("view_names") or DAILY_VIEW_NAMES)
     source_name = _daily_table_name(source_month)
     target_name = _daily_table_name(target_month)
     tables = _list_tables(app_token, prefer_user=True)
@@ -604,7 +648,7 @@ def prepare_daily_template(
             target_month_value,
             prefer_user=True,
         )
-        created_views = _ensure_daily_views(app_token, target_table_id, prefer_user=True)
+        created_views = _ensure_daily_views(app_token, target_table_id, prefer_user=True, view_names=view_names)
         return {
             "success": True,
             "store_label": store_label,
@@ -627,7 +671,7 @@ def prepare_daily_template(
     ]
     if not dry_run:
         _batch_update_records(app_token, table_id, update_rows, prefer_user=True)
-        created_views = _ensure_daily_views(app_token, table_id, prefer_user=True)
+        created_views = _ensure_daily_views(app_token, table_id, prefer_user=True, view_names=view_names)
     else:
         created_views = []
     return {

@@ -2,20 +2,28 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sys
 import urllib.request
 from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import Body, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from run_dashboard_sheet_export import run_dashboard_sheet_export
+from run_meta_audience_export import build_meta_audience_export
 from run_rakuten_orders import run_rakuten_orders_sync
+from run_sku_review import inspect_pending_skus, read_pending_sku_status
+from run_tomtoc_dashboard_sheet import run_tomtoc_dashboard_sheet
+from run_yearly_dashboard_charts import run_yearly_dashboard_charts
 from src.features.ecommerce.rakuten.daily_template import inspect_daily_tables, prepare_daily_template
+from src.features.ecommerce.rakuten.weekly_sheet import run_tomtoc_weekly_sheet_sync
 from src.features.ecommerce.amazon.keyword_tracker import run_keyword_tracking
 from src.features.ecommerce.amazon.rank_sync import run_amazon_rank_sync
 from src.features.feishu.user_oauth import build_oauth_url, exchange_code_and_store
@@ -29,13 +37,35 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Agent Hub API", lifespan=lifespan)
 
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("API_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    if origin.strip()
+]
+api_token = os.getenv("API_TOKEN", "").strip()
+public_api_paths = {"/api/health", "/api/lark/oauth/callback"}
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "X-Audience-Rows", "X-Orders-Count", "X-Store-Label", "X-SPU"],
 )
+
+
+@app.middleware("http")
+async def require_api_token(request: Request, call_next):
+    if (
+        api_token
+        and request.method != "OPTIONS"
+        and request.url.path.startswith("/api/")
+        and request.url.path not in public_api_paths
+        and request.headers.get("X-API-Token") != api_token
+    ):
+        return JSONResponse({"success": False, "message": "Unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 @app.get("/api/health")
@@ -109,6 +139,106 @@ def rakuten_daily_template(body: dict | None = Body(default=None)):
         )
     except Exception as exc:
         return {"success": False, "message": str(exc)}
+
+
+@app.post("/api/ecommerce/rakuten/tomtoc-weekly-sheet/sync")
+def rakuten_tomtoc_weekly_sheet_sync(body: dict | None = Body(default=None)):
+    body = body or {}
+    try:
+        return run_tomtoc_weekly_sheet_sync(
+            start_date=body.get("start_date"),
+            end_date=body.get("end_date"),
+            dry_run=bool(body.get("dry_run")),
+            inspect=bool(body.get("inspect")),
+        )
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+
+@app.post("/api/ecommerce/rakuten/yearly-dashboard/sync")
+def rakuten_yearly_dashboard_sync(body: dict | None = Body(default=None)):
+    body = body or {}
+    try:
+        return run_yearly_dashboard_charts(store_id=body.get("store_id") or "default")
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+
+@app.post("/api/ecommerce/rakuten/dashboard-sheet/sync")
+def rakuten_dashboard_sheet_sync(body: dict | None = Body(default=None)):
+    body = body or {}
+    store_id = body.get("store_id") or "default"
+    if str(store_id).lower() in {"store2", "tomtoc"}:
+        return {
+            "success": False,
+            "message": "tomtoc 的 Sheet Dashboard DB 不在这里更新，请使用下方「更新 tomtoc 仪表盘」入口。",
+        }
+    try:
+        return run_dashboard_sheet_export(
+            store_id=store_id,
+            include_base_link=bool(body.get("include_base_link", False)),
+        )
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+
+@app.post("/api/ecommerce/rakuten/tomtoc-dashboard-sheet/sync")
+def rakuten_tomtoc_dashboard_sheet_sync():
+    try:
+        return run_tomtoc_dashboard_sheet()
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+
+@app.get("/api/ecommerce/rakuten/sku-review")
+def rakuten_sku_review_status():
+    try:
+        return read_pending_sku_status()
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+
+@app.post("/api/ecommerce/rakuten/sku-review/refresh")
+def rakuten_sku_review_refresh(body: dict | None = Body(default=None)):
+    body = body or {}
+    try:
+        store_ids = body.get("store_ids") or ["default", "store2"]
+        return inspect_pending_skus(
+            store_ids=tuple(store_ids),
+            start_date=body.get("start_date"),
+            end_date=body.get("end_date"),
+            write_status=True,
+        )
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+
+@app.post("/api/meta-ads/audience/export")
+def meta_ads_audience_export(body: dict | None = Body(default=None)):
+    body = body or {}
+    try:
+        export = build_meta_audience_export(
+            store_id=body.get("store_id") or "default",
+            start_date=body.get("start_date"),
+            end_date=body.get("end_date"),
+            spu=body.get("spu"),
+        )
+        filename = quote(export.filename)
+        return Response(
+            content=export.csv_text.encode("utf-8"),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+                "X-Audience-Rows": str(export.audience_rows),
+                "X-Orders-Count": str(export.orders_count),
+                "X-Store-Label": export.store_label,
+                "X-SPU": export.spu or "ALL",
+            },
+        )
+    except ValueError as exc:
+        return JSONResponse({"success": False, "message": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"success": False, "message": str(exc)}, status_code=500)
 
 
 @app.get("/api/ecommerce/rakuten/daily-template/tables")
